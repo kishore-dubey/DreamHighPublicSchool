@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+DOMAIN="${1:-}"
+if [[ -z "$DOMAIN" ]]; then
+  echo "Usage: $0 <domain>  (e.g. ./deploy-ec2.sh dreamhighpublicschool.in)" >&2
+  exit 1
+fi
+if [[ ! "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "Invalid domain: $DOMAIN" >&2
+  exit 1
+fi
+
 APP_DIR="${APP_DIR:-/home/ec2-user/DPS}"
 APP_USER="${APP_USER:-ec2-user}"
 SERVICE_NAME="dreamhigh"
@@ -97,19 +107,19 @@ WantedBy=multi-user.target
 EOF
 
 log "Configuring Nginx"
-sudo tee /etc/nginx/conf.d/dreamhigh.conf >/dev/null <<'EOF'
+sudo tee /etc/nginx/conf.d/dreamhigh.conf >/dev/null <<EOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN www.$DOMAIN;
 
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 }
 EOF
@@ -131,7 +141,8 @@ log "Checking the local website response"
 for attempt in {1..15}; do
   if curl -fsS http://127.0.0.1:3000/ >/dev/null 2>&1; then
     echo "DreamHigh is running successfully."
-    echo "Open the EC2 public IPv4 address in your browser using http://"
+    echo "Open: http://$DOMAIN"
+    echo "Add HTTPS with: sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN"
     exit 0
   fi
   sleep 2

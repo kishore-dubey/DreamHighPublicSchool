@@ -40,6 +40,7 @@ On AWS:
 - The matching EC2 key pair.
 - An inbound security-group rule allowing TCP port `22` from the administrator's public IP.
 - An inbound security-group rule allowing TCP port `80` from visitors, normally `0.0.0.0/0` and `::/0`.
+- An inbound security-group rule allowing TCP port `443` from visitors for HTTPS.
 
 Port `3000` should not be opened publicly. Nginx connects to the application locally and exposes it through port `80`.
 
@@ -119,8 +120,13 @@ On the EC2 instance:
 
 ```bash
 cd /home/ec2-user/DPS
-./deploy-ec2.sh
+./deploy-ec2.sh dreamhighpublicschool.in
 ```
+
+The domain is **required** — the script creates an nginx config in
+`/etc/nginx/conf.d/dreamhigh.conf` scoped to that domain. It does **not**
+overwrite the main `nginx.conf`, so it is safe to run alongside other
+projects on the same server.
 
 The deployment script:
 
@@ -129,13 +135,30 @@ The deployment script:
 3. Installs the exact project dependencies using `npm ci`.
 4. Creates the production build using `npm run build`.
 5. Creates and enables a `dreamhigh.service` systemd unit.
-6. Configures Nginx to proxy port `80` to the application on `127.0.0.1:3000`.
+6. Configures Nginx to proxy the specified domain on port `80` to the application on `127.0.0.1:3000`.
 7. Starts both services and checks the application's local HTTP response.
 
 After a successful deployment, open:
 
 ```text
-http://EC2_PUBLIC_IPV4
+http://dreamhighpublicschool.in
+```
+
+### Step 4: Add HTTPS
+
+After the site is live on HTTP, add a free SSL certificate with Let's Encrypt:
+
+```bash
+sudo dnf install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d dreamhighpublicschool.in -d www.dreamhighpublicschool.in
+```
+
+Choose option **2** (redirect HTTP to HTTPS) when prompted. Certbot automatically modifies the nginx config and sets up auto-renewal.
+
+Enable the renewal timer:
+
+```bash
+sudo systemctl enable --now certbot-renew.timer
 ```
 
 ### Deployment-script configuration
@@ -150,10 +173,10 @@ The script accepts optional environment variables:
 Example:
 
 ```bash
-APP_DIR=/home/ec2-user/DPS APP_USER=ec2-user ./deploy-ec2.sh
+APP_DIR=/home/ec2-user/DPS APP_USER=ec2-user ./deploy-ec2.sh dreamhighpublicschool.in
 ```
 
-The script is intended for Amazon Linux systems with `dnf` or `yum`. It does not currently configure a domain name or HTTPS certificate.
+The script is intended for Amazon Linux systems with `dnf` or `yum`.
 
 ## Updating an existing deployment
 
@@ -173,7 +196,7 @@ ssh -i "C:\path\to\your-key.pem" ec2-user@EC2_PUBLIC_IPV4
 
 ```bash
 cd /home/ec2-user/DPS
-./deploy-ec2.sh
+./deploy-ec2.sh dreamhighpublicschool.in
 ```
 
 The deployment script can be run again safely. It refreshes dependencies, rebuilds the website, updates the service configuration, and restarts the application.
@@ -267,3 +290,184 @@ The Node.js version must be 22.13 or newer.
 ### `curl-minimal` conflicts with `curl`
 
 Amazon Linux 2023 normally includes `curl-minimal`. It already provides the `curl` command and cannot be installed alongside the full `curl` package. The current deployment script deliberately leaves `curl-minimal` in place. If an older copy of the script reports this package conflict, upload the project again so the corrected `deploy-ec2.sh` replaces it, then rerun the deployment.
+
+## Setting up multiple projects on the same EC2 instance
+
+This guide covers deploying DPS alongside Skyline Empire (or any other
+project) on a single EC2 server. Each app runs on its own port with its
+own nginx config file in `/etc/nginx/conf.d/`.
+
+### Prerequisites
+
+- Amazon Linux 2023 EC2 instance (t3.micro or larger)
+- Security group rules: TCP 22 (from your IP), TCP 80 + 443 (from anywhere)
+- Domains pointing to the EC2 public IP:
+  - GoDaddy A record `@` → EC2 IP (e.g. `dreamhighpublicschool.in`)
+  - DuckDNS dashboard IP update (e.g. `skyline-empire.duckdns.org`)
+
+### Step 1: SSH into the EC2
+
+```bash
+ssh -i "your-key.pem" ec2-user@EC2_PUBLIC_IP
+```
+
+### Step 2: Copy both projects to the server
+
+From your local machine:
+
+```bash
+scp -r /path/to/DPS ec2-user@EC2_PUBLIC_IP:~/
+scp -r /path/to/skyline-empire ec2-user@EC2_PUBLIC_IP:~/
+```
+
+### Step 3: Deploy DPS first
+
+DPS installs nginx and nvm/Node — deploy it first so the infrastructure
+is ready:
+
+```bash
+cd ~/DPS
+chmod +x deploy-ec2.sh
+./deploy-ec2.sh dreamhighpublicschool.in
+```
+
+Verify:
+
+```bash
+curl http://127.0.0.1:3000/
+```
+
+### Step 4: Clean up nginx default config
+
+The default `nginx.conf` has a `default_server` block that conflicts
+with multiple sites. Replace it:
+
+```bash
+sudo tee /etc/nginx/nginx.conf >/dev/null <<'EOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile            on;
+    tcp_nopush          on;
+    keepalive_timeout   65;
+    types_hash_max_size 4096;
+
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### Step 5: Deploy Skyline Empire
+
+```bash
+cd ~/skyline-empire
+chmod +x deploy/deploy.sh
+sudo ./deploy/deploy.sh skyline-empire.duckdns.org
+```
+
+The script detects nvm-installed Node from DPS, copies files to
+`/opt/myairline/`, creates `myairline` service (port 4173), and creates
+`/etc/nginx/conf.d/skyline.conf`.
+
+Verify:
+
+```bash
+curl http://127.0.0.1:4173/
+```
+
+### Step 6: Reload nginx and test both sites
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+
+curl -H "Host: dreamhighpublicschool.in" http://127.0.0.1/
+curl -H "Host: skyline-empire.duckdns.org" http://127.0.0.1/
+```
+
+### Step 7: Add HTTPS for both sites
+
+```bash
+sudo dnf install -y certbot python3-certbot-nginx
+
+# DPS
+sudo certbot --nginx -d dreamhighpublicschool.in -d www.dreamhighpublicschool.in
+
+# Skyline
+sudo certbot --nginx -d skyline-empire.duckdns.org
+```
+
+Choose option **2** (redirect HTTP to HTTPS) each time.
+
+Enable auto-renewal:
+
+```bash
+sudo systemctl enable --now certbot-renew.timer
+```
+
+### Step 8: Verify everything
+
+From your laptop:
+
+```bash
+curl -I https://dreamhighpublicschool.in/
+curl -I https://skyline-empire.duckdns.org/
+```
+
+### Final architecture
+
+```
+Internet → :80/:443 nginx
+               ├── dreamhighpublicschool.in    → 127.0.0.1:3000  (dreamhigh, Next.js)
+               └── skyline-empire.duckdns.org  → 127.0.0.1:4173  (myairline, Node.js)
+
+systemd services:
+  ├── dreamhigh  → npm start (port 3000)
+  └── myairline  → node server.js (port 4173)
+
+SSL: Let's Encrypt (auto-renewing via certbot-renew.timer)
+```
+
+### Updating later
+
+Re-run the same deploy commands — they won't overwrite each other's
+nginx configs or databases:
+
+```bash
+# Update DPS
+cd ~/DPS && ./deploy-ec2.sh dreamhighpublicschool.in
+
+# Update Skyline
+cd ~/skyline-empire && sudo ./deploy/deploy.sh skyline-empire.duckdns.org
+```
+
+### Adding a 3rd project later
+
+Same pattern:
+
+1. Copy project to EC2
+2. Run its deploy script with its domain (use a new port, e.g. 4175)
+3. Create `/etc/nginx/conf.d/thirdapp.conf` with its domain
+4. `sudo nginx -t && sudo systemctl reload nginx`
+5. `sudo certbot --nginx -d third-domain.com`
